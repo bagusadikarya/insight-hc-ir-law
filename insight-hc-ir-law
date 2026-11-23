@@ -1,0 +1,164 @@
+"""
+Insight Otomatis: HC, Hubungan Industrial, Hukum & Teknologi
+-------------------------------------------------------------
+Cara kerja:
+1. Mengambil berita terbaru dari Google News (RSS) untuk tiap topik di topik.json
+2. Mengirim daftar berita ke Claude untuk dianalisis
+3. Menyimpan hasil insight ke folder docs/ (tampil sebagai website lewat GitHub Pages)
+
+Tidak perlu library tambahan: hanya memakai Python standar.
+Kunci API dibaca dari "secret" GitHub bernama ANTHROPIC_API_KEY.
+"""
+
+import json
+import os
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
+
+WIB = timezone(timedelta(hours=7))
+DOCS = "docs"
+MODEL = "claude-sonnet-5-5"
+
+
+def ambil_berita(kata_kunci, hari=7, maks=8):
+    """Ambil berita dari Google News RSS (bahasa Indonesia) untuk satu kata kunci."""
+    q = urllib.parse.quote(f"{kata_kunci} when:{hari}d")
+    url = f"https://news.google.com/rss/search?q={q}&hl=id&gl=ID&ceid=ID:id"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        root = ET.fromstring(r.read())
+
+    hasil = []
+    for item in root.iter("item"):
+        tanggal = item.findtext("pubDate", "")
+        try:
+            tanggal = parsedate_to_datetime(tanggal).astimezone(WIB).strftime("%d %b %Y")
+        except Exception:
+            pass
+        hasil.append({
+            "judul": item.findtext("title", "").strip(),
+            "link": item.findtext("link", "").strip(),
+            "tanggal": tanggal,
+        })
+        if len(hasil) >= maks:
+            break
+    return hasil
+
+
+def tanya_claude(prompt):
+    """Kirim prompt ke Claude API dan kembalikan teks jawabannya."""
+    api_key = os.environ["ANTHROPIC_API_KEY"]
+    body = json.dumps({
+        "model": MODEL,
+        "max_tokens": 4000,
+        "messages": [{"role": "user", "content": prompt}],
+    }).encode()
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=body,
+        headers={
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=180) as r:
+        data = json.loads(r.read())
+    return "".join(b.get("text", "") for b in data["content"])
+
+
+def main():
+    with open("topik.json", encoding="utf-8") as f:
+        cfg = json.load(f)
+
+    # 1. Kumpulkan berita per topik, buang judul ganda
+    terlihat = set()
+    bahan = []
+    for topik in cfg["topik"]:
+        bahan.append(f"\n## {topik['nama']}")
+        for kk in topik["kata_kunci"]:
+            try:
+                berita = ambil_berita(kk, cfg.get("rentang_hari", 7))
+            except Exception as e:
+                print(f"Gagal mengambil '{kk}': {e}")
+                continue
+            for b in berita:
+                if b["judul"] in terlihat:
+                    continue
+                terlihat.add(b["judul"])
+                bahan.append(f"- [{b['tanggal']}] {b['judul']} — {b['link']}")
+
+    if not terlihat:
+        print("Tidak ada berita yang berhasil diambil. Berhenti.")
+        return
+
+    # 2. Minta Claude menyusun insight
+    prompt = f"""{cfg['peran']}
+
+Berikut daftar judul berita terbaru, dikelompokkan per topik:
+{chr(10).join(bahan)}
+
+Susun laporan insight dalam Bahasa Indonesia, format Markdown:
+1. **Ringkasan Eksekutif** (3–5 poin terpenting minggu ini)
+2. Untuk tiap topik: perkembangan utama, **dampak bagi perusahaan/HR**, dan **rekomendasi tindakan**
+3. **Regulasi yang perlu dipantau** (sebut nomor peraturan hanya jika tertulis di judul berita)
+4. **Sumber**: daftar tautan berita yang Anda gunakan
+
+Aturan: hanya gunakan informasi dari daftar di atas, jangan mengarang fakta.
+Jika sebuah informasi belum pasti, tulis "perlu dicek".
+"""
+    laporan = tanya_claude(prompt)
+
+    # 3. Simpan sebagai halaman website
+    os.makedirs(DOCS, exist_ok=True)
+    hari_ini = datetime.now(WIB).strftime("%Y-%m-%d")
+    with open(f"{DOCS}/{hari_ini}.md", "w", encoding="utf-8") as f:
+        f.write(f"# Insight {hari_ini}\n\n{laporan}\n")
+
+    # Halaman depan: laporan terbaru + arsip
+    arsip = sorted(
+        (n[:-3] for n in os.listdir(DOCS) if n[:4].isdigit() and n.endswith(".md")),
+        reverse=True,
+    )
+    with open(f"{DOCS}/index.md", "w", encoding="utf-8") as f:
+        f.write(f"# {cfg['judul_situs']}\n\n")
+        f.write(f"_Diperbarui otomatis: {hari_ini}_\n\n")
+        f.write(laporan)
+        f.write("\n\n---\n## Arsip\n")
+        for a in arsip:
+            f.write(f"- [{a}]({a}.md)\n")
+
+    print(f"Selesai: {DOCS}/{hari_ini}.md ({len(terlihat)} berita dianalisis)")
+
+
+if __name__ == "__main__":
+    main()
+{
+  "judul_situs": "Insight HC, Hubungan Industrial, Hukum & Teknologi",
+  "rentang_hari": 7,
+  "peran": "Anda adalah analis senior di bidang Human Capital, Hubungan Industrial, dan hukum ketenagakerjaan Indonesia yang menulis untuk konsultan dan praktisi HR.",
+  "topik": [
+    {
+      "nama": "Human Capital",
+      "kata_kunci": ["human capital Indonesia", "manajemen SDM perusahaan", "tren HR"]
+    },
+    {
+      "nama": "Hubungan Industrial",
+      "kata_kunci": ["hubungan industrial", "serikat pekerja", "upah minimum", "PHK karyawan", "alih daya outsourcing"]
+    },
+    {
+      "nama": "Hukum Ketenagakerjaan",
+      "kata_kunci": ["peraturan ketenagakerjaan", "Kemnaker regulasi", "putusan MK ketenagakerjaan", "RUU Ketenagakerjaan"]
+    },
+    {
+      "nama": "Teknologi & HR",
+      "kata_kunci": ["AI HR rekrutmen", "HR tech Indonesia", "pelindungan data pribadi karyawan"]
+    }
+  ]
+}
+# Insight HC, Hubungan Industrial, Hukum & Teknologi
+
+Laporan pertama akan muncul di sini setelah workflow dijalankan.
